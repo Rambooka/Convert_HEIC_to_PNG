@@ -10,7 +10,9 @@ The original is deleted (optional) only after the new file has been written
 and verified to decode.
 """
 
+import json
 import os
+import re
 import sys
 import threading
 import queue
@@ -35,6 +37,12 @@ DEFAULT_COMPRESSION = 50
 
 # How many files are converted at once.
 WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+# Options and window position are remembered between runs here. Not next to
+# the program: the one-file .exe unpacks itself to a new temp folder each run.
+SETTINGS_FILE = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "HEIC_to_PNG", "settings.json")
+DEFAULT_GEOMETRY = (780, 540)
 
 ZONE_BG = "#f4f6f8"
 ZONE_BG_HOVER = "#dceefc"
@@ -231,6 +239,44 @@ def convert_to_heic(src_path, compression, delete_original=False):
     return _convert_file(src_path, ".heic", save, delete_original, must_be_smaller=True)
 
 
+def load_settings(path):
+    """The saved settings dict, or {} when there is none yet or it can't be
+    read (each value is still type-checked by the caller)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):  # unreadable or corrupt -> start from defaults
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(path, data):
+    """Best effort: failing to remember a setting must never get in the way
+    of converting, so a write error is ignored. Written to a temp file and
+    renamed, so a crash mid-write can't leave a half-written file."""
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def virtual_screen():
+    """(left, top, width, height) of the desktop spanning every monitor, or
+    None when it can't be found (non-Windows)."""
+    try:
+        from ctypes import windll
+        gsm = windll.user32.GetSystemMetrics
+        return gsm(76), gsm(77), gsm(78), gsm(79)  # SM_X/Y/CX/CYVIRTUALSCREEN
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def parse_drop_data(root, data):
     """tkdnd gives a Tcl list; paths with spaces are wrapped in {braces}."""
     try:
@@ -240,14 +286,16 @@ def parse_drop_data(root, data):
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, settings_path=SETTINGS_FILE):
         self.root = root
         self.q = queue.Queue()
         self.busy = False
+        self.settings_path = settings_path
+        self.settings = load_settings(settings_path)
 
         root.title(APP_TITLE)
-        root.geometry("780x540")
         root.minsize(640, 440)
+        self._restore_window()
 
         main = ttk.Frame(root, padding=10)
         main.pack(fill="both", expand=True)
@@ -268,7 +316,7 @@ class App:
         self.drop.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         left_opts = ttk.Frame(zones)
         left_opts.grid(row=1, column=0, sticky="nw", padx=(0, 5), pady=(6, 0))
-        self.var_delete = tk.BooleanVar(value=True)
+        self.var_delete = tk.BooleanVar(value=self._saved_bool("delete_heic", True))
         ttk.Checkbutton(left_opts, text="Delete HEIC after conversion",
                         variable=self.var_delete).pack(anchor="w")
 
@@ -285,7 +333,7 @@ class App:
         comp_row = ttk.Frame(right_opts)
         comp_row.pack(anchor="w")
         ttk.Label(comp_row, text="Compression %:").pack(side="left")
-        self.var_compression = tk.StringVar(value=str(DEFAULT_COMPRESSION))
+        self.var_compression = tk.StringVar(value=str(self._saved_compression()))
         only_digits = (root.register(lambda s: s == "" or (s.isdigit() and len(s) <= 3)), "%P")
         self.compression_box = ttk.Spinbox(
             comp_row, from_=0, to=100, increment=5, width=5,
@@ -295,14 +343,14 @@ class App:
         self.compression_box.pack(side="left", padx=(6, 0))
         ttk.Label(right_opts, text="0 = best quality, 100 = smallest file",
                   foreground="#666").pack(anchor="w")
-        self.var_delete_src = tk.BooleanVar(value=False)
+        self.var_delete_src = tk.BooleanVar(value=self._saved_bool("delete_src", False))
         ttk.Checkbutton(right_opts, text="Delete JPG/PNG after conversion",
                         variable=self.var_delete_src).pack(anchor="w")
 
         # Shared options
         opts = ttk.Frame(main)
         opts.pack(fill="x", pady=(8, 4))
-        self.var_recursive = tk.BooleanVar(value=True)
+        self.var_recursive = tk.BooleanVar(value=self._saved_bool("recursive", True))
         ttk.Checkbutton(opts, text="Include subfolders", variable=self.var_recursive).pack(side="left")
 
         # Progress
@@ -327,7 +375,63 @@ class App:
         root.drop_target_register(DND_FILES)
         root.dnd_bind("<<Drop>>", self.on_window_drop)
 
-        self.root.after(100, self._poll)
+        # Remember every option as soon as it changes, and the window on close
+        for var in (self.var_delete, self.var_delete_src, self.var_recursive, self.var_compression):
+            var.trace_add("write", lambda *_: self._save_settings())
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._poll_id = self.root.after(100, self._poll)
+
+    # ---- Remembered settings ---------------------------------------------
+    def _saved_bool(self, key, default):
+        value = self.settings.get(key)
+        return value if isinstance(value, bool) else default
+
+    def _saved_compression(self):
+        value = self.settings.get("compression")
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100:
+            return value
+        return DEFAULT_COMPRESSION
+
+    def _restore_window(self):
+        """Last run's size, and its position if that is still on a monitor
+        (a monitor may have been unplugged since)."""
+        width, height = DEFAULT_GEOMETRY
+        position = ""
+        m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", str(self.settings.get("geometry", "")))
+        if m:
+            width, height, x, y = (int(g) for g in m.groups())
+            screen = virtual_screen()
+            if screen:
+                left, top, sw, sh = screen
+                # keep it only if the title bar's left part is on the desktop
+                if left <= x <= left + sw - 100 and top <= y <= top + sh - 50:
+                    position = f"+{x}+{y}"
+        self.root.geometry(f"{width}x{height}{position}")
+        if self.settings.get("maximized") is True:
+            self.root.after(0, lambda: self.root.state("zoomed"))
+
+    def _save_settings(self, include_window=False):
+        data = dict(self.settings)
+        data["delete_heic"] = self.var_delete.get()
+        data["delete_src"] = self.var_delete_src.get()
+        data["recursive"] = self.var_recursive.get()
+        text = self.var_compression.get().strip()
+        if text.isdigit() and 0 <= int(text) <= 100:  # half-typed values aren't saved
+            data["compression"] = int(text)
+        if include_window:
+            maximized = self.root.state() == "zoomed"
+            data["maximized"] = maximized
+            if not maximized and self.root.state() == "normal":
+                # wm_geometry is "WxH+X+Y"; Tk writes a negative X as "+-120"
+                data["geometry"] = self.root.wm_geometry()
+        self.settings = data
+        save_settings(self.settings_path, data)
+
+    def on_close(self):
+        self._save_settings(include_window=True)
+        self.root.after_cancel(self._poll_id)
+        self.root.destroy()
 
     # ---- UI helpers -------------------------------------------------------
     def _make_drop_zone(self, parent, text, on_paths, on_browse):
@@ -474,7 +578,7 @@ class App:
                     self._log(msg, "ok" if fail == 0 else "err")
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self._poll_id = self.root.after(100, self._poll)
 
 
 def main():
