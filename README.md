@@ -5,12 +5,23 @@ A small Windows app that converts HEIC/HEIF photos (e.g. from iPhones) to PNG.
 ![icon](app.png)
 
 ## Features
-- Drag files **or folders** from File Explorer onto the window (or click to browse)
+- Two drop zones: **HEIC → PNG** and **JPG / PNG → HEIC**
+- Drag files **or folders** from File Explorer onto a drop zone (or click it to browse)
+- JPG/PNG → HEIC has a **Compression %** box: 0 = best quality / largest file,
+  100 = smallest file (default 50). Camera JPGs stored sideways are rotated upright,
+  EXIF and ICC profile are kept, and the JPG/PNG is kept unless you tick
+  "Delete JPG/PNG after conversion"
+- A HEIC is only kept if it is **smaller** than the original; otherwise it is discarded,
+  the original is left untouched, and the log shows `SKIP` with both sizes
+- Converts up to 8 files at once (fewer on smaller PCs) — HEIC → PNG is ~6× faster
+  on a big batch; JPG → HEIC gains less because the HEIC encoder already uses every core
+- Remembers your settings between runs — the checkboxes, compression %, and window
+  size/position (in `%APPDATA%\HEIC_to_PNG\settings.json`; delete it to reset)
 - Optional recursion into subfolders
 - Each PNG is written next to the original, keeping timestamps, EXIF and ICC profile
 - The HEIC is deleted **only after** the PNG has been written and verified (optional)
 - Never overwrites: name clashes become `photo (1).png`
-- Files/folders can also be dropped onto the `.exe` icon
+- Files/folders can also be dropped onto the `.exe` icon (converted HEIC → PNG)
 
 ## Download
 Grab `HEIC_to_PNG.exe` from the [Releases](../../releases) page — single file, no install needed.
