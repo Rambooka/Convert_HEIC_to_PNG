@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -31,6 +32,9 @@ APP_ID = "ICT.HEICtoPNG.Converter.1"
 # Compression % for JPG/PNG -> HEIC. HEIC quality = 100 - compression, so the
 # default of 50 is pillow-heif's own default quality.
 DEFAULT_COMPRESSION = 50
+
+# How many files are converted at once.
+WORKERS = max(1, min(8, os.cpu_count() or 1))
 
 ZONE_BG = "#f4f6f8"
 ZONE_BG_HOVER = "#dceefc"
@@ -87,23 +91,55 @@ def collect_files(paths, exts, recursive=True):
     return out
 
 
-def unique_path(src_path, new_ext):
-    """`photo.heic` -> `photo.png`, or `photo (1).png` if that already exists."""
+# Output names claimed by a conversion still in progress. Files are converted
+# in parallel, so `photo.jpg` and `photo.png` could otherwise both pick
+# `photo.heic` before either has written it.
+_name_lock = threading.Lock()
+_reserved_names = set()
+
+
+def reserve_unique_path(src_path, new_ext):
+    """`photo.heic` -> `photo.png`, or `photo (1).png` if that already exists
+    or another worker has claimed it. Pair with release_path()."""
     base = os.path.splitext(src_path)[0]
     candidate = base + new_ext
     n = 1
-    while os.path.exists(candidate):
-        candidate = f"{base} ({n}){new_ext}"
-        n += 1
+    with _name_lock:
+        while os.path.exists(candidate) or os.path.normcase(candidate) in _reserved_names:
+            candidate = f"{base} ({n}){new_ext}"
+            n += 1
+        _reserved_names.add(os.path.normcase(candidate))
     return candidate
 
 
-def _convert_file(src_path, new_ext, save, delete_original):
+def release_path(path):
+    with _name_lock:
+        _reserved_names.discard(os.path.normcase(path))
+
+
+class NotSmallerError(Exception):
+    """The new file came out no smaller than the original, so it was
+    discarded and the original kept."""
+
+
+def human_size(n):
+    if n < 1024:
+        return f"{n:,} bytes"
+    if n < 1024 * 1024:
+        return f"{n / 1024:,.1f} KB"
+    return f"{n / (1024 * 1024):,.2f} MB"
+
+
+def _convert_file(src_path, new_ext, save, delete_original, must_be_smaller=False):
     """Shared plumbing for both directions: write to a .part file, prove it
     decodes, rename it into place, keep the original's timestamps, and only
     then (optionally) delete the original. Returns the new path; raises on
-    failure, leaving the original untouched."""
-    out_path = unique_path(src_path, new_ext)
+    failure, leaving the original untouched.
+
+    With `must_be_smaller`, a new file that isn't strictly smaller than the
+    original is thrown away (NotSmallerError) and the original is kept, even
+    when `delete_original` is set."""
+    out_path = reserve_unique_path(src_path, new_ext)
     tmp_path = out_path + ".part"
     try:
         with Image.open(src_path) as im:
@@ -112,6 +148,14 @@ def _convert_file(src_path, new_ext, save, delete_original):
         # Verify the new file decodes before touching the original
         with Image.open(tmp_path) as check:
             check.load()
+
+        if must_be_smaller:
+            new_size = os.path.getsize(tmp_path)
+            old_size = os.path.getsize(src_path)
+            if new_size >= old_size:
+                raise NotSmallerError(
+                    f"{new_ext.lstrip('.').upper()} would be {human_size(new_size)}, "
+                    f"original is {human_size(old_size)} - kept the original only")
         os.replace(tmp_path, out_path)
 
         # Keep original timestamps on the new file
@@ -127,6 +171,9 @@ def _convert_file(src_path, new_ext, save, delete_original):
                 os.remove(tmp_path)
             except OSError:
                 pass
+        # Either the file now exists on disk or it was never written; the
+        # in-memory claim is no longer needed in both cases.
+        release_path(out_path)
 
 
 def _save_png(im, tmp_path):
@@ -152,6 +199,9 @@ def convert_to_heic(src_path, compression, delete_original=False):
 
     `compression` is 0-100 %: 0 = best quality / largest file,
     100 = smallest file / worst quality (HEIC quality = 100 - compression).
+
+    The HEIC is only kept if it is smaller than the original; otherwise it is
+    discarded, the original is left alone, and NotSmallerError is raised.
     """
     if not 0 <= compression <= 100:
         raise ValueError(f"compression must be 0-100 %, got {compression}")
@@ -178,7 +228,7 @@ def convert_to_heic(src_path, compression, delete_original=False):
             save_kwargs["icc_profile"] = icc
         im.save(tmp_path, **save_kwargs)
 
-    return _convert_file(src_path, ".heic", save, delete_original)
+    return _convert_file(src_path, ".heic", save, delete_original, must_be_smaller=True)
 
 
 def parse_drop_data(root, data):
@@ -271,6 +321,7 @@ class App:
         sb.pack(side="right", fill="y")
         self.log.tag_configure("err", foreground="#b00020")
         self.log.tag_configure("ok", foreground="#1b5e20")
+        self.log.tag_configure("skip", foreground="#8a6d00")
 
         # A drop anywhere else on the window is HEIC -> PNG (the original behaviour)
         root.drop_target_register(DND_FILES)
@@ -376,22 +427,31 @@ class App:
     def _run(self, files, job, target):
         self.busy = True
         self.progress.configure(maximum=len(files), value=0)
+        threads = min(WORKERS, len(files))
         self.status.configure(text=f"Converting {len(files)} file(s) to {target}...")
-        self._log(f"--- {len(files)} file(s) queued -> {target} ---")
+        self._log(f"--- {len(files)} file(s) queued -> {target}, {threads} at a time ---")
         threading.Thread(target=self._worker, args=(files, job), daemon=True).start()
 
     def _worker(self, files, job):
-        ok = fail = 0
-        for i, f in enumerate(files, 1):
-            try:
-                out = job(f)
-                ok += 1
-                self.q.put(("log", f"OK   {f}  ->  {os.path.basename(out)}", "ok"))
-            except Exception as ex:  # noqa: BLE001
-                fail += 1
-                self.q.put(("log", f"FAIL {f}: {ex}", "err"))
-            self.q.put(("progress", i, len(files)))
-        self.q.put(("done", ok, fail))
+        """Runs on a background thread: converts the files in parallel and
+        reports each one back to the UI (in completion order) via the queue."""
+        ok = skipped = fail = 0
+        with ThreadPoolExecutor(max_workers=min(WORKERS, len(files))) as pool:
+            futures = {pool.submit(job, f): f for f in files}
+            for i, fut in enumerate(as_completed(futures), 1):
+                f = futures[fut]
+                try:
+                    out = fut.result()
+                    ok += 1
+                    self.q.put(("log", f"OK   {f}  ->  {os.path.basename(out)}", "ok"))
+                except NotSmallerError as ex:
+                    skipped += 1
+                    self.q.put(("log", f"SKIP {f}: {ex}", "skip"))
+                except Exception as ex:  # noqa: BLE001
+                    fail += 1
+                    self.q.put(("log", f"FAIL {f}: {ex}", "err"))
+                self.q.put(("progress", i, len(files)))
+        self.q.put(("done", ok, skipped, fail))
 
     def _poll(self):
         try:
@@ -405,9 +465,13 @@ class App:
                     self.status.configure(text=f"Converting {item[1]}/{item[2]}...")
                 elif kind == "done":
                     self.busy = False
-                    msg = f"Done. {item[1]} converted, {item[2]} failed."
+                    ok, skipped, fail = item[1], item[2], item[3]
+                    msg = f"Done. {ok} converted, "
+                    if skipped:
+                        msg += f"{skipped} skipped (HEIC not smaller), "
+                    msg += f"{fail} failed."
                     self.status.configure(text=msg)
-                    self._log(msg, "ok" if item[2] == 0 else "err")
+                    self._log(msg, "ok" if fail == 0 else "err")
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
